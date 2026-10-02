@@ -1,0 +1,140 @@
+# RG-OPD training config.
+#
+# Reproduces the setup in Appendix A.1 of Akhondzadeh et al., "Reward-Gated On-Policy
+# Distillation" (arXiv:2607.04037): a frozen Qwen2.5-14B-Instruct teacher served over a
+# dedicated vLLM endpoint (tensor-parallel=2), distilling into a Qwen2.5-1.5B-Instruct
+# student trained end-to-end with FSDP, on a subset of UltraInteract, for 3 epochs with
+# AdamW (lr=5e-6, 50-step warmup), using top-K=50 reverse-KL distillation with tail
+# correction (Eq. 4) gated by the reward-teacher likelihood gate (Eq. 1-2, delta=0).
+#
+# Launch from the `verl/` directory (this repo's vendored framework root) so the hydra
+# searchpath below and `recipe.*` imports resolve, e.g.:
+#   cd verl && python -m recipe.rgopd.main_rgopd
+# See recipe/rgopd/README.md and recipe/rgopd/scripts/ for full instructions, including
+# how to start the teacher server this config points at.
+#
+# Nothing below is a secret or a machine-specific path: every path/host is either a
+# relative default (works from a fresh checkout) or an ${oc.env:VAR,default} override.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: ["${oc.env:RGOPD_DATA_DIR,./data/rgopd}/train.parquet"]
+  val_files: ["${oc.env:RGOPD_DATA_DIR,./data/rgopd}/test.parquet"]
+  train_batch_size: 32
+  max_prompt_length: 2048
+  max_response_length: 8192
+  filter_overlong_prompts: True
+  shuffle: True
+  trust_remote_code: True
+  # Set to a task-appropriate instruction if your data doesn't already start with a
+  # system turn; UltraInteract spans math/coding/logic, so we leave this unset (null)
+  # by default rather than force a single-domain system prompt.
+  system_prompt: null
+
+actor_rollout_ref:
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 1
+    # RG-OPD's top-K distillation forward (recipe/rgopd/dp_actor.py) only implements the
+    # padded path; see recipe/rgopd/README.md#limitations.
+    use_remove_padding: False
+    ulysses_sequence_parallel_size: 1
+    use_kl_loss: False
+    optim:
+      lr: 5.0e-6
+      lr_warmup_steps: 50
+    recipe:
+      rgopd:
+        distillation:
+          # K in Eq. 4 (top-K reverse-KL with tail correction). Table 2 (Appendix A.2)
+          # shows performance improves with K up to a point and plateaus; 50 is the
+          # paper's default.
+          topk: 50
+          add_tail: True
+          # Optional importance-sampling ratio clip on the distillation loss, for
+          # off-policy correction across ppo_epochs > 1 / multiple minibatches. Not
+          # discussed in the paper (which trains on-policy); off by default.
+          is_clip: null
+        gate:
+          # Eq. 1-2. Set to False to recover the ungated "Reverse-KL" baseline from
+          # Table 1/3 (same distillation loss, applied unconditionally).
+          enabled: True
+          # Confidence margin delta in Eq. 2. Paper uses delta=0.
+          margin: 0.0
+          # Span the L_T vs L_S comparison is aggregated over, matching
+          # `rt_gate_chunk_size` in the TTT-Reflex implementation this was ported from.
+          # 1 = per-token (default), k>1 = k-token chunks, <=0 = whole trajectory.
+          # The whole-trajectory form is degenerate -- it keeps 0% of reward-positive and
+          # 100% of reward-negative trajectories -- see compute_reward_teacher_gate's
+          # docstring for the measurements.
+          chunk_size: 1
+          # Zero-advantage trajectories come from degenerate GRPO groups (every sample in
+          # the group scored the same), so they carry no reward direction to agree with.
+          # "mask" drops them (TTT-Reflex's rt_gate_zero_adv default); "keep" passes them
+          # through ungated. Ignored when failure_includes_zero=True.
+          zero_adv: mask
+          # Treat A_i == 0 as a failure rather than masking it (TTT-Reflex's
+          # rt_gate_failure_includes_zero; false there and here).
+          failure_includes_zero: False
+        teacher:
+          # "external": a separate frozen model served over the network (the paper's
+          #   setup -- see scripts/serve_teacher.sh). "ema" / "trust-region": a
+          #   self-teacher scoring the student's own rollout, no second model (see
+          #   recipe/rgopd/README.md#teacher-sources).
+          source: external
+          external:
+            server_ip: ${oc.env:RGOPD_TEACHER_HOST,localhost}
+            server_port: ${oc.env:RGOPD_TEACHER_PORT,15555}
+            n_server_workers: 1
+          # Only used when teacher.source=ema.
+          ema_update_rate: 0.05
+          # Only used when teacher.source=trust-region.
+          trust_region_mix_coef: 0.05
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    n: 8
+    gpu_memory_utilization: 0.5
+    log_prob_micro_batch_size_per_gpu: 1
+    calculate_log_probs: True
+    val_kwargs:
+      top_p: 0.95
+      temperature: 0.6
+      n: 4
+      do_sample: True
+  model:
+    path: ${oc.env:RGOPD_STUDENT_MODEL,Qwen/Qwen2.5-1.5B-Instruct}
+    trust_remote_code: True
+
+algorithm:
+  # Disables the critic; A_i in the gate (Eq. 1-2) is the GRPO advantage, as in the paper.
+  adv_estimator: grpo
+  use_kl_in_reward: False
+
+custom_reward_function:
+  path: pkg://recipe.rgopd.reward_score
+  name: compute_score
+
+reward_model:
+  use_reward_loop: False
+
+trainer:
+  project_name: ${oc.env:WANDB_PROJECT,rgopd}
+  experiment_name: ${oc.env:RGOPD_EXPERIMENT,rgopd-qwen2.5-1.5b}
+  logger: ["console"]
+  n_gpus_per_node: ${oc.env:RGOPD_GPUS_PER_NODE,2}
+  nnodes: 1
+  save_freq: 50
+  test_freq: 5
+  val_before_train: True
+  total_epochs: 3
+  default_local_dir: ${oc.env:RGOPD_CKPT_DIR,./checkpoints}/${trainer.experiment_name}

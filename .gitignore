@@ -1,0 +1,41 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors
+.vscode/
+.idea/
+
+# Env files (may hold local overrides such as RGOPD_TEACHER_HOST); never commit real secrets here
+.env
+
+# Logs
+*.log
+nohup.out
+
+# RG-OPD default data / checkpoint / eval-output locations (see recipe/rgopd/config/rgopd_trainer.yaml
+# and recipe/rgopd/README.md for the RGOPD_DATA_DIR / RGOPD_CKPT_DIR env vars that control these paths).
+# Scoped to these specific directories rather than a blanket `*.parquet`/`*.safetensors` -- a repo-wide
+# glob would also silently hide any such file a user actually wants tracked elsewhere.
+/data/
+/checkpoints/
+/eval_results/
+/data/**/*.parquet
+/checkpoints/**/*.safetensors
+
+# Weights & Biases local run cache
+wandb/
